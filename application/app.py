@@ -12,7 +12,6 @@ import asyncio
 import io
 import langgraph_agent
 import skill
-import multimodal
 
 from notification_queue import NotificationQueue
 
@@ -59,7 +58,7 @@ with st.sidebar:
         "Amazon Bedrock을 이용해 다양한 형태의 대화를 구현합니다." 
         "여기에서는 SKILL과 MCP를 이용해 agent의 기능을 확장합니다." 
         "주요 코드는 LangGraph를 이용해 구현되었습니다.\n"
-        "상세한 코드는 [Github](https://github.com/kyopark2014/rag-multimodal)을 참조하세요."
+        "상세한 코드는 [Github](https://github.com/kyopark2014/rag-s3-vector)을 참조하세요."
     )
 
     st.subheader("🐱 대화 형태")
@@ -284,7 +283,7 @@ if uploaded_file is not None and clear_button==False:
             file_url = chat.upload_to_s3(uploaded_file.getvalue(), file_name)
             logger.info(f"file_url: {file_url}")
 
-            body = multimodal.sync_data_source(file_url)  # sync uploaded files
+            body = utils.sync_data_source()  # sync uploaded files
 
             st.write(body)
             st.session_state.processed_files[file_key] = body
