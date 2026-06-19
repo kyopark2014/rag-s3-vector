@@ -16,6 +16,8 @@ from botocore.exceptions import ClientError
 # Configuration (must match installer.py)
 project_name = "rag-s3-vector"
 region = "us-west-2"
+AGENTCORE_GATEWAY_REGION = "us-east-1"
+AGENTCORE_WEBSEARCH_GATEWAY_NAME = "gateway-websearch"
 cloudfront_comment = "CloudFront-for-rag-project"
 oai_comment = "OAI for RAG Project"
 
@@ -33,6 +35,10 @@ secrets_client = boto3.client("secretsmanager", region_name=region)
 s3vectors_client = boto3.client("s3vectors", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
 bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
+agentcore_control_client = boto3.client(
+    "bedrock-agentcore-control",
+    region_name=AGENTCORE_GATEWAY_REGION,
+)
 
 
 def s3_vectors_bucket_arn(bucket: str = vector_bucket_name) -> str:
@@ -256,6 +262,114 @@ def delete_knowledge_bases():
         logger.error(f"Error deleting Knowledge Bases: {e}")
 
 
+def _list_all_agentcore_gateways():
+    gateways = []
+    next_token = None
+    while True:
+        kwargs = {}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = agentcore_control_client.list_gateways(**kwargs)
+        gateways.extend(response.get("items", []))
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+    return gateways
+
+
+def _list_all_agentcore_gateway_targets(gateway_id: str):
+    targets = []
+    next_token = None
+    while True:
+        kwargs = {"gatewayIdentifier": gateway_id}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = agentcore_control_client.list_gateway_targets(**kwargs)
+        targets.extend(response.get("items", []))
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+    return targets
+
+
+def delete_agentcore_websearch_gateway(skip_confirmation: bool = False) -> bool:
+    """Delete AgentCore gateway-websearch and its web-search targets."""
+    logger.info("[2.5/6] Deleting AgentCore Web Search gateway")
+
+    gateway_id = None
+    try:
+        for gateway in _list_all_agentcore_gateways():
+            if gateway.get("name") == AGENTCORE_WEBSEARCH_GATEWAY_NAME:
+                gateway_id = gateway["gatewayId"]
+                logger.info(
+                    f"  Found gateway: {AGENTCORE_WEBSEARCH_GATEWAY_NAME} ({gateway_id})"
+                )
+                break
+
+        if not gateway_id:
+            logger.info(
+                f"  AgentCore gateway not found: {AGENTCORE_WEBSEARCH_GATEWAY_NAME}"
+            )
+            return True
+
+        if not skip_confirmation:
+            print("\n" + "=" * 60)
+            print(
+                f"AgentCore gateway '{AGENTCORE_WEBSEARCH_GATEWAY_NAME}' "
+                f"({gateway_id}) in {AGENTCORE_GATEWAY_REGION} will be deleted."
+            )
+            print("This includes all gateway targets (web-search connector).")
+            print("=" * 60)
+            response = input(
+                "\nDelete AgentCore Web Search gateway? (yes/no) [no]: "
+            ).strip().lower()
+            if response != "yes":
+                logger.info(
+                    "  Skipping AgentCore Web Search gateway deletion (default: no)."
+                )
+                return False
+
+        for target in _list_all_agentcore_gateway_targets(gateway_id):
+            target_id = target.get("targetId")
+            target_name = target.get("name", target_id)
+            try:
+                agentcore_control_client.delete_gateway_target(
+                    gatewayIdentifier=gateway_id,
+                    targetId=target_id,
+                )
+                logger.info(f"  ✓ Deleted gateway target: {target_name} ({target_id})")
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                    logger.warning(
+                        f"  Could not delete gateway target {target_name}: {e}"
+                    )
+
+        for _ in range(18):
+            remaining_targets = _list_all_agentcore_gateway_targets(gateway_id)
+            if not remaining_targets:
+                break
+            logger.info(
+                f"  Waiting for {len(remaining_targets)} gateway target(s) to be deleted..."
+            )
+            time.sleep(10)
+
+        agentcore_control_client.delete_gateway(gatewayIdentifier=gateway_id)
+        logger.info(f"  ✓ Deleted gateway: {gateway_id}")
+        logger.info("✓ AgentCore Web Search gateway deleted")
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            logger.info(
+                f"  AgentCore gateway already deleted: {AGENTCORE_WEBSEARCH_GATEWAY_NAME}"
+            )
+            return True
+        logger.warning(f"  Could not delete AgentCore Web Search gateway: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error deleting AgentCore Web Search gateway: {e}")
+        return False
+
+
 def delete_s3_vectors_store():
     """Delete S3 vector index and vector bucket."""
     logger.info("[3/6] Deleting S3 Vectors store")
@@ -291,11 +405,18 @@ def delete_s3_vectors_store():
         logger.error(f"Error deleting S3 Vectors store: {e}")
 
 
-def delete_iam_roles():
+def delete_iam_roles(delete_agentcore_gateway_role: bool = True):
     """Delete Knowledge Base IAM role created by installer."""
     logger.info("[4/6] Deleting IAM roles")
 
     role_names = [knowledge_base_role_name]
+    if delete_agentcore_gateway_role:
+        role_names.append(f"role-agentcore-gateway-websearch-for-{project_name}")
+    else:
+        logger.info(
+            "  Keeping AgentCore gateway IAM role "
+            f"(role-agentcore-gateway-websearch-for-{project_name})"
+        )
 
     for role_name in role_names:
         try:
@@ -433,6 +554,11 @@ def clear_config_json(delete_s3_bucket: bool = False, delete_cloudfront: bool = 
         "vector_bucket_arn",
         "vector_index_name",
         "vector_index_arn",
+        "agentcore_websearch_gateway_name",
+        "agentcore_websearch_gateway_region",
+        "agentcore_websearch_gateway_id",
+        "agentcore_websearch_gateway_url",
+        "agentcore_websearch_gateway_role",
     ]
     if delete_s3_bucket:
         installer_fields.extend(["s3_bucket", "s3_arn"])
@@ -492,6 +618,14 @@ def main():
         action="store_true",
         help="Delete shared CloudFront distribution and OAI (default: keep)",
     )
+    parser.add_argument(
+        "--delete-agentcore-gateway",
+        action="store_true",
+        help=(
+            "Delete AgentCore gateway-websearch without a separate confirmation prompt "
+            "(default: ask, default answer no)"
+        ),
+    )
     args = parser.parse_args()
 
     if not args.yes:
@@ -539,8 +673,11 @@ def main():
     try:
         # Project-specific resources (always deleted)
         delete_knowledge_bases()
+        agentcore_gateway_deleted = delete_agentcore_websearch_gateway(
+            skip_confirmation=args.delete_agentcore_gateway
+        )
         delete_s3_vectors_store()
-        delete_iam_roles()
+        delete_iam_roles(delete_agentcore_gateway_role=agentcore_gateway_deleted)
         delete_secrets()
         clear_config_json(
             delete_s3_bucket=delete_s3_bucket,

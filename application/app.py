@@ -71,7 +71,8 @@ with st.sidebar:
     
     # mcp selection    
     mcp_options = [
-        "s3_vector", 
+        "s3_vector",
+        "websearch",
         "aws_documentation", 
         "web_fetch",
         "text_extraction",
