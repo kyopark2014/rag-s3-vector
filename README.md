@@ -6,12 +6,14 @@ Amazon Bedrock Knowledge Base와 **Amazon S3 Vectors**를 벡터 스토어로 �
 
 1. [S3 Vectors 개요](#s3-vectors-개요) — 개념, 구성 요소, 성능·통합·사용 사례
 2. [시스템 구성](#시스템-구성) — 아키텍처, 데이터 흐름, AWS 리소스, 앱 구조, UI
-3. [사전 요구 사항](#사전-요구-사항)
-4. [설치](#설치--installerpy) — `installer.py`, 문서 인덱싱
-5. [애플리케이션 실행](#애플리케이션-실행)
-6. [활용 방법](#활용-방법) — QueryVectors API 예시
-7. [제거](#제거--uninstallerpy) — `uninstaller.py`
-8. [참고 문서 링크](#참고-문서-링크)
+3. [Metadata Filtering](#metadata-filtering-s3-vectors--bedrock-knowledge-bases) — sidecar, S3 Vectors 필터 연산자, Bedrock Retrieve
+4. [사전 요구 사항](#사전-요구-사항)
+5. [설치](#설치--installerpy) — `installer.py`, 문서 인덱싱
+6. [애플리케이션 실행](#애플리케이션-실행)
+7. [활용 방법](#활용-방법) — QueryVectors API 예시
+8. [제거](#제거--uninstallerpy) — `uninstaller.py`
+9. [실행 결과](#실행-결과)
+10. [참고 문서 링크](#참고-문서-링크)
 
 ## S3 Vectors 개요
 
@@ -152,6 +154,150 @@ rag-s3-vector/
 | 이미지 첨부 | 클립보드/파일 업로드 → S3 URL 첨부 |
 | 로컬 User ID | 쿠키 세션으로 사용자별 대화·업로드 구분 |
 
+## Metadata Filtering (S3 Vectors + Bedrock Knowledge Bases)
+
+Amazon Bedrock Knowledge Bases는 원본 문서와 함께 `파일명.확장자.metadata.json` sidecar를 S3에 올리면 문서별 커스텀 메타데이터를 인덱싱합니다.
+조회 시 `Retrieve`의 `vectorSearchConfiguration.filter`로 사전 필터링한 뒤 유사도 검색을 수행합니다. 벡터 스토어가 **S3 Vectors**일 때도 sidecar → 인제스션 → 필터 조회 흐름은 동일하며, 필터 연산자·크기 제한은 스토어별로 다릅니다.
+
+- Bedrock: [Include metadata](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-metadata.html) · [Configure queries / metadata filters](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-test-config.html)
+- S3 Vectors: [Metadata filtering](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-metadata-filtering.html) · [Querying vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-query.html) · [Limitations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html)
+
+이 프로젝트는 UI/API RAG 업로드 시 `application/services/rag_service.py`가
+`docs/{projectName}/{user_id}/{file}` 와 함께 `{file}.metadata.json` sidecar를 업로드합니다.
+`installer.py`는 Bedrock KB용 non-filterable 키(`AMAZON_BEDROCK_TEXT`, `AMAZON_BEDROCK_METADATA`)를 인덱스에 미리 등록합니다.
+
+### 본 프로젝트 sidecar 스키마
+
+Bedrock이 지원하는 타입은 `STRING` / `NUMBER` / `BOOLEAN` / `STRING_LIST` 입니다.
+
+| 속성 | 타입 | 예시 | 용도 |
+|------|------|------|------|
+| `owner` | `STRING_LIST` | `["user01"]` | 업로더 `user_id` (list/멤버십 필터) |
+| `team` | `STRING` | `"mycompany"` | 팀/조직 스코프 |
+| `created_time` | `NUMBER` | `1786366000` | Unix epoch(초). 범위 필터용 |
+| `is_confidential` | `BOOLEAN` | `false` | 기밀 여부 |
+
+메타데이터 파일 예시:
+
+```json
+{
+  "metadataAttributes": {
+    "owner": {
+      "value": { "type": "STRING_LIST", "stringListValue": ["user01"] },
+      "includeForEmbedding": false
+    },
+    "team": {
+      "value": { "type": "STRING", "stringValue": "mycompany" },
+      "includeForEmbedding": false
+    },
+    "created_time": {
+      "value": { "type": "NUMBER", "numberValue": 1786366000 },
+      "includeForEmbedding": false
+    },
+    "is_confidential": {
+      "value": { "type": "BOOLEAN", "booleanValue": false },
+      "includeForEmbedding": false
+    }
+  }
+}
+```
+
+모든 속성은 `includeForEmbedding: false`로 두어 **필터 전용**으로 씁니다.
+
+### S3 Vectors 네이티브 메타데이터 필터
+
+S3 Vectors는 **filterable** / **non-filterable** 두 종류를 지원합니다.
+
+| 구분 | 특징 |
+|------|------|
+| **Filterable** (기본) | `QueryVectors`의 `filter`에 사용. 타입: string, number, boolean, list. 벡터당 **최대 약 2 KB** |
+| **Non-filterable** | 인덱스 생성 시 키를 명시. 필터 불가·크기 여유. 원문 청크 등 컨텍스트 저장용. `returnMetadata`로 조회 가능 |
+
+기타 한도(요약): 벡터당 메타데이터 합계 최대 **40 KB**, 키 최대 **50**개, non-filterable 키 인덱스당 최대 **10**개. 한도 초과 시 `PutVectors`가 `400 Bad Request`를 반환합니다.
+
+유사도 검색과 필터는 **동시에** 평가됩니다(검색 후 후처리가 아님). 매칭 결과가 적으면 `topK`보다 적은 결과가 반환될 수 있습니다. non-filterable 키로 필터하면 `400 Bad Request`입니다.
+
+#### `QueryVectors` 필터 연산자
+
+[AWS 문서](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-metadata-filtering.html) 기준:
+
+| 연산자 | 입력 타입 | 설명 |
+|--------|-----------|------|
+| `$eq` | String, Number, Boolean | 일치. 메타데이터가 **배열**이면 원소 중 하나와 같으면 true |
+| `$ne` | String, Number, Boolean | 불일치 |
+| `$gt` / `$gte` / `$lt` / `$lte` | Number | 대소 비교 |
+| `$in` / `$nin` | 비어 있지 않은 primitive 배열 | 배열에 포함 / 미포함 |
+| `$exists` | Boolean | 해당 메타데이터 키 존재 여부 |
+| `$and` / `$or` | 필터 배열 | 논리 AND / OR |
+
+연산자를 생략하면 `$eq`로 처리됩니다. 예: `{ "genre": "documentary" }` ≡ `{ "genre": { "$eq": "documentary" } }`.
+
+```python
+# 단순 동등
+{"genre": "scifi"}
+
+# 명시적 연산자
+{"genre": {"$eq": "documentary"}}
+{"genre": {"$ne": "drama"}}
+{"year": {"$gte": 2020}}
+{"genre": {"$in": ["comedy", "documentary"]}}
+{"genre": {"$exists": true}}
+
+# 논리 조합 / 동일 필드 범위
+{"$and": [{"genre": {"$eq": "drama"}}, {"year": {"$gte": 2020}}]}
+{"price": {"$gte": 10, "$lte": 50}}
+```
+
+배열 메타데이터 예: `"category": ["documentary", "romance"]` 인 벡터는 `{ "category": { "$eq": "documentary" } }` 에 매칭됩니다.
+
+### Bedrock Knowledge Base `Retrieve` 필터 (S3 Vectors 백엔드)
+
+Knowledge Base API는 Bedrock 필터 이름을 사용합니다. S3 Vectors를 벡터 스토어로 쓸 때:
+
+- **`startsWith`**, **`stringContains`** 는 **사용할 수 없습니다** ([Configure queries](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-test-config.html)).
+- `equals` / `notEquals` / `greaterThan` / `greaterThanOrEquals` / `lessThan` / `lessThanOrEquals` 및 `andAll` / `orAll` 조합을 사용합니다.
+- `in` / `notIn` / `listContains` 는 문서상 OpenSearch Serverless 등에서 가장 잘 지원됩니다. S3 Vectors에서는 동일 효과를 **네이티브 `$eq` / `$in`**(배열 메타데이터) 또는 Bedrock `equals`로 검증하는 것이 안전합니다.
+
+```python
+retrievalConfiguration={
+    "vectorSearchConfiguration": {
+        "numberOfResults": 5,
+        "filter": {
+            "andAll": [
+                {"equals": {"key": "team", "value": "mycompany"}},
+                {"greaterThanOrEquals": {"key": "created_time", "value": 1700000000}},
+                {"equals": {"key": "is_confidential", "value": False}},
+            ]
+        },
+    }
+}
+```
+
+`STRING_LIST`인 `owner`에 대해 OpenSearch 계열에서는 `listContains`를 쓰는 패턴이 일반적입니다.
+
+```python
+"filter": {
+    "listContains": {"key": "owner", "value": "<user_id>"}
+}
+```
+
+S3 Vectors `QueryVectors`에서는 동일 의도를 예를 들어 다음처럼 표현할 수 있습니다(`$eq`가 리스트 원소와 매칭).
+
+```python
+filter={"owner": {"$eq": "user01"}}
+# 또는
+filter={"owner": {"$in": ["user01"]}}
+```
+
+### 검색 설정 요약
+
+| 경로 | 검색 | 필터 |
+|------|------|------|
+| Bedrock `Retrieve` | 의미 검색 (S3 Vectors 인덱스) | Bedrock 필터 JSON (`equals`, 범위, `andAll`/`orAll` …). `startsWith`/`stringContains` 불가 |
+| S3 Vectors `QueryVectors` | 임베딩 유사도 + 동시 메타데이터 평가 | `$eq`, `$gt`, `$in`, `$and` … |
+
+Agent 경로에서는 `langgraph_agent`가 RAG MCP(`kb-retrieve`)에 `RAG_USER_ID`를 주입해 사용자 스코프를 넘길 수 있습니다. 업로드 시 sidecar의 `owner`가 그 사용자 ID로 채워집니다.
+
 ## 사전 요구 사항
 
 - Python 3.10+
@@ -229,8 +375,7 @@ cd application/web && npm install && npm run dev
 
 ## 활용 방법
 
-QueryVectors API를 사용하여 유사도 검색을 수행할 수 있습니다.
-검색 시 지정할 수 있는 주요 파라미터에는 쿼리 벡터, 반환할 결과 수(K-최근접 이웃), 인덱스 ARN, 메타데이터 필터(선택사항)가 있습니다.
+QueryVectors API로 유사도 검색을 수행합니다. 주요 파라미터는 쿼리 벡터, `topK`, 인덱스(버킷/이름 또는 ARN), 선택적 **메타데이터 `filter`** 입니다. 필터 문법·한도는 [Metadata Filtering](#metadata-filtering-s3-vectors--bedrock-knowledge-bases)을 참고하세요.
 
 ```python
 import boto3 
@@ -259,6 +404,23 @@ response = s3vectors.query_vectors(
     topK=3, 
     returnDistance=True,
     returnMetadata=True
+)
+
+# 메타데이터 필터와 함께 쿼리 (team + created_time 범위 예시)
+response = s3vectors.query_vectors(
+    vectorBucketName="rag-s3-vector-{accountId}",
+    indexName="rag-s3-vector",
+    queryVector={"float32": embedding},
+    topK=3,
+    filter={
+        "$and": [
+            {"team": {"$eq": "mycompany"}},
+            {"created_time": {"$gte": 1700000000}},
+            {"is_confidential": {"$eq": False}},
+        ]
+    },
+    returnDistance=True,
+    returnMetadata=True,
 )
 ```
 
@@ -305,13 +467,13 @@ python uninstaller.py --yes --delete-s3-bucket --delete-cloudfront
 
 ## 실행 결과
 
-채팅창의 '+' 버튼을 눌러서 [Upload to RAG]를 선택후 파일을 업로드 합니다. 업로드후 Amazon S3를 보면 아래와 같이 업로드한 "error_code.pdf"에 더해 "error_code.pdf.metadata.json"가 업로드 됩니다. 
+채팅창의 '+' 버튼을 눌러서 [Upload to RAG]를 선택후 파일을 업로드 합니다. 업로드후 Amazon S3를 보면 아래와 같이 업로드한 "error_code.pdf"에 더해 "error_code.pdf.metadata.json"가 업로드 됩니다. sidecar 스키마·필터 연산자는 [Metadata Filtering](#metadata-filtering-s3-vectors--bedrock-knowledge-bases)을 참고하세요.
 
 <img width="421" height="189" alt="image" src="https://github.com/user-attachments/assets/7cbf851e-699f-4167-8b7b-e6447cc0d09c" />
 
 이때, "error_code.pdf.metadata.json"에는 아래와 같이 문서의 owner, team과 함께 생성시간 정보가 함께 기입됩니다.
 
-```java
+```json
 {
   "metadataAttributes": {
     "owner": {
@@ -352,15 +514,20 @@ python uninstaller.py --yes --delete-s3-bucket --delete-cloudfront
 
 <img width="925" height="641" alt="image" src="https://github.com/user-attachments/assets/02fd7bd7-7e98-4c42-bf07-5eec9bc14b97" />
 
-
-
-
 ## 참고 문서 링크
 
 [Working with S3 Vectors and vector buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html)
 
-[boto3 - create_vector_bucket](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3vectors/client/create_vector_bucket.html)
+[Metadata filtering (S3 Vectors)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-metadata-filtering.html)
 
 [Querying vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-query.html)
 
+[Limitations and restrictions (S3 Vectors)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html)
+
+[boto3 - create_vector_bucket](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3vectors/client/create_vector_bucket.html)
+
 [Amazon Bedrock Knowledge Bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html)
+
+[Include metadata in a data source](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-metadata.html)
+
+[Configure and customize queries (metadata filters)](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-test-config.html)
