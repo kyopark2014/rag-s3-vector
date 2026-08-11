@@ -303,6 +303,58 @@ python uninstaller.py --yes --delete-s3-bucket --delete-cloudfront
 
 > CloudFront는 비활성화 후 배포가 완전히 내려가야 삭제됩니다. 삭제가 건너뛰어지면 `--delete-cloudfront`로 재실행하세요.
 
+## 실행 결과
+
+채팅창의 '+' 버튼을 눌러서 [Upload to RAG]를 선택후 파일을 업로드 합니다. 업로드후 Amazon S3를 보면 아래와 같이 업로드한 "error_code.pdf"에 더해 "error_code.pdf.metadata.json"가 업로드 됩니다. 
+
+<img width="421" height="189" alt="image" src="https://github.com/user-attachments/assets/7cbf851e-699f-4167-8b7b-e6447cc0d09c" />
+
+이때, "error_code.pdf.metadata.json"에는 아래와 같이 문서의 owner, team과 함께 생성시간 정보가 함께 기입됩니다.
+
+```java
+{
+  "metadataAttributes": {
+    "owner": {
+      "value": {
+        "type": "STRING_LIST",
+        "stringListValue": [
+          "user01"
+        ]
+      },
+      "includeForEmbedding": false
+    },
+    "team": {
+      "value": {
+        "type": "STRING",
+        "stringValue": "mycompany"
+      },
+      "includeForEmbedding": false
+    },
+    "created_time": {
+      "value": {
+        "type": "NUMBER",
+        "numberValue": 1786452602
+      },
+      "includeForEmbedding": false
+    },
+    "is_confidential": {
+      "value": {
+        "type": "BOOLEAN",
+        "booleanValue": false
+      },
+      "includeForEmbedding": false
+    }
+  }
+}
+```
+
+이후 "knowledge base로 보일러 에러 코드 검토하세요."라고 입력하면 아래와 같은 결과를 얻을 수 있습니다. 이때 Knowledge Base를 조회하는 retrieve tool이 이용되었습니다.
+
+<img width="925" height="641" alt="image" src="https://github.com/user-attachments/assets/02fd7bd7-7e98-4c42-bf07-5eec9bc14b97" />
+
+
+
+
 ## 참고 문서 링크
 
 [Working with S3 Vectors and vector buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html)
