@@ -3,13 +3,20 @@ import sys
 import os
 import subprocess
 import traceback
-import chat
 import utils
 import skill
 import mcp_config
 import agentcore_sigv4_auth
 import datetime
 import boto3
+
+# Prefer package import so FastAPI (`application.chat`) and this module share
+# one user_id global. Bare `import chat` would load a second module copy when
+# application/ is also on sys.path via application/__init__.py.
+try:
+    from application import chat
+except ImportError:
+    import chat
         
 from typing import Literal, Optional
 from langgraph.prebuilt import ToolNode
@@ -24,7 +31,10 @@ from pytz import timezone
 from langchain_core.tools import tool
 from urllib import parse
 from urllib import parse as url_parse
-from notification_queue import NotificationQueue
+try:
+    from notification_queue import QueueNotificationSink as NotificationQueue
+except ImportError:
+    NotificationQueue = None  # type: ignore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -187,6 +197,68 @@ _exec_globals = {
     "WORKING_DIR": WORKING_DIR,
     "ARTIFACTS_DIR": ARTIFACTS_DIR,
 }
+
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def _guess_image_media_type(url: str, content_type: str | None = None) -> str:
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+        return ct
+    path = (parse.urlparse(url).path or "").lower()
+    if path.endswith(".png"):
+        return "image/png"
+    if path.endswith(".gif"):
+        return "image/gif"
+    if path.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _is_image_url(url: str) -> bool:
+    path = (parse.urlparse(url).path or "").lower()
+    return any(path.endswith(ext) for ext in _IMAGE_EXTS)
+
+
+def _image_url_to_content_block(url: str) -> dict | None:
+    """Download an image URL and return a LangChain image_url content block."""
+    try:
+        import base64
+        import httpx
+
+        response = httpx.get(url, timeout=30.0, follow_redirects=True)
+        response.raise_for_status()
+        media_type = _guess_image_media_type(url, response.headers.get("content-type"))
+        b64 = base64.b64encode(response.content).decode("ascii")
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{b64}"},
+        }
+    except Exception:
+        logger.warning("Failed to load image for multimodal message: %s", url, exc_info=True)
+        return None
+
+
+def _build_user_message(query: str, files: list | None = None) -> HumanMessage:
+    """Build a HumanMessage; image attachments become multimodal content blocks."""
+    text = (query or "").strip()
+    image_urls = [u for u in (files or []) if u and _is_image_url(u)]
+    if not image_urls:
+        return HumanMessage(content=text or query or "")
+
+    content: list[dict] = []
+    for url in image_urls:
+        block = _image_url_to_content_block(url)
+        if block:
+            content.append(block)
+        else:
+            text = (text + "\n\n" if text else "") + f"Attached image (failed to inline): {url}"
+
+    if not text:
+        text = "첨부한 이미지를 분석해주세요."
+    content.append({"type": "text", "text": text})
+    return HumanMessage(content=content)
+
 
 _KOREAN_WEEKDAYS = ("월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일")
 
@@ -1022,7 +1094,16 @@ def load_multiple_mcp_server_parameters(mcp_json: dict):
                 }
     return server_info
 
-async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="Disable") -> tuple[str, list]:
+async def create_agent(
+    mcp_servers: list,
+    skill_list: list,
+    history_mode: str = "Disable",
+    user_id: str | None = None,
+) -> tuple[str, list]:
+    session_user_id = (user_id or chat.user_id or "").strip()
+    if session_user_id and chat.user_id != session_user_id:
+        chat.user_id = session_user_id
+
     # builtin tools
     tools = get_builtin_tools()
     logger.info(f"builtin_tools count: {len(tools)}")
@@ -1032,7 +1113,16 @@ async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="D
     # logger.info(f"mcp_json: {mcp_json}")
 
     server_params = load_multiple_mcp_server_parameters(mcp_json)
-    # logger.info(f"server_params: {server_params}")    
+    # logger.info(f"server_params: {server_params}")
+
+    # Scope RAG MCP retrieve to the current session user via env (optional filter).
+    for server_name in ("kb-retrieve", "kb_retriever", "kb-retriever"):
+        params = server_params.get(server_name)
+        if params and params.get("transport") == "stdio":
+            env = dict(params.get("env") or {})
+            env["RAG_USER_ID"] = session_user_id
+            params["env"] = env
+            logger.info("%s MCP RAG_USER_ID=%s", server_name, session_user_id)
 
     try:
         client = MultiServerMCPClient(server_params)
@@ -1070,11 +1160,12 @@ async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="D
         logger.warning("No tools available, using general conversation mode")
         return None, None
     
+    thread_id = session_user_id or chat.user_id
     if history_mode == "Enable":
         app = buildChatAgentWithHistory(tools)
         config = {
             "recursion_limit": 500,
-            "configurable": {"thread_id": chat.user_id},
+            "configurable": {"thread_id": thread_id},
             "tools": tools,
             "system_prompt": system_prompt,
             "max_turns": MAX_CONTEXT_TURNS,
@@ -1083,7 +1174,7 @@ async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="D
         app = buildChatAgent(tools)
         config = {
             "recursion_limit": 500,
-            "configurable": {"thread_id": chat.user_id},
+            "configurable": {"thread_id": thread_id},
             "tools": tools,
             "system_prompt": system_prompt,
             "max_turns": MAX_CONTEXT_TURNS,
@@ -1123,9 +1214,22 @@ async def _prior_tool_call_ids(app, config) -> set:
         return set()
 
 
-async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list, history_mode: str="Disable", notification_queue: NotificationQueue =None) -> tuple[str, list]:
+async def run_langgraph_agent(
+    query: str,
+    mcp_servers: list,
+    skill_list: list,
+    history_mode: str = "Disable",
+    notification_queue: NotificationQueue = None,
+    user_id: str | None = None,
+    files: list | None = None,
+) -> tuple[str, list]:
     global app, config, active_mcp_servers, active_skills, current_id
-    
+
+    session_user_id = (user_id or chat.user_id or "").strip()
+    if session_user_id and chat.user_id != session_user_id:
+        chat.user_id = session_user_id
+        logger.info("Synced chat.user_id for RAG/MCP: %s", session_user_id)
+
     queue = notification_queue if notification_queue else None
     if queue:
         queue.reset()
@@ -1134,19 +1238,29 @@ async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list, h
     artifact_paths = []
     references = []
 
-    if app is None or active_mcp_servers != mcp_servers or active_skills != skill_list or current_id != chat.user_id:
+    if (
+        app is None
+        or active_mcp_servers != mcp_servers
+        or active_skills != skill_list
+        or current_id != session_user_id
+    ):
         active_mcp_servers = mcp_servers
         active_skills = skill_list
-        current_id = chat.user_id
+        current_id = session_user_id
 
-        app, config = await create_agent(mcp_servers, skill_list, history_mode)
+        app, config = await create_agent(
+            mcp_servers,
+            skill_list,
+            history_mode,
+            user_id=session_user_id,
+        )
     
     if app is None:
         logger.error("Failed to create agent - app is None")
         return "에이전트를 생성할 수 없습니다. MCP 서버 설정 또는 도구 구성을 확인해주세요.", []
     
     inputs = {
-        "messages": [HumanMessage(content=query)]
+        "messages": [_build_user_message(query, files)]
     }
 
     prior_tool_call_ids = set()

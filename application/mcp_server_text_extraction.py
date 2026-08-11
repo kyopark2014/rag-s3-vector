@@ -29,11 +29,13 @@ logger = logging.getLogger("text-extraction-mcp")
 
 config = utils.load_config()
 bedrock_region = config.get("region", "us-west-2")
-model_name = "Claude 5.0 Sonnet"
+# Vision / OCR for images — Claude Sonnet 4.6
+model_name = "Claude 4.6 Sonnet"
 models = info.get_model_info(model_name)
 profile = models[0]
 model_id = profile["model_id"]
 model_type = profile["model_type"]
+logger.info("text_extraction model: %s (%s)", model_name, model_id)
 
 try:
     mcp = FastMCP(

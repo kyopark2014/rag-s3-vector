@@ -9,7 +9,7 @@ import json
 import time
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from botocore.exceptions import ClientError
 
 # Configuration
@@ -170,8 +170,12 @@ def create_s3_bucket() -> str:
         raise
 
 
-def create_iam_role(role_name: str, assume_role_policy: Dict, managed_policies: Optional[List[str]] = None) -> str:
-    """Create IAM role."""
+def create_iam_role(
+    role_name: str,
+    assume_role_policy: Dict,
+    managed_policies: Optional[List[str]] = None,
+) -> Tuple[str, bool]:
+    """Create IAM role. Returns (role_arn, created)."""
     logger.debug(f"Creating IAM role: {role_name}")
     
     try:
@@ -193,7 +197,7 @@ def create_iam_role(role_name: str, assume_role_policy: Dict, managed_policies: 
                 logger.debug(f"Attached policy: {policy_arn}")
         
         logger.info(f"✓ IAM role created: {role_name}")
-        return role_arn
+        return role_arn, True
     
     except ClientError as e:
         if e.response["Error"]["Code"] == "EntityAlreadyExists":
@@ -244,7 +248,7 @@ def create_iam_role(role_name: str, assume_role_policy: Dict, managed_policies: 
                 except ClientError as policy_error:
                     logger.warning(f"Could not update managed policies: {policy_error}")
             
-            return role_arn
+            return role_arn, False
         logger.error(f"Failed to create IAM role {role_name}: {e}")
         raise
 
@@ -263,6 +267,20 @@ def attach_inline_policy(role_name: str, policy_name: str, policy_document: Dict
         logger.error(f"Error attaching/updating policy {policy_name}: {e}")
         raise
 
+def wait_for_iam_role_propagation(role_name: str, wait_seconds: int = 20) -> None:
+    """Wait for a newly created IAM role (and inline policies) to become assumable."""
+    logger.info(f"  Waiting {wait_seconds}s for IAM role propagation: {role_name}")
+    time.sleep(wait_seconds)
+    try:
+        attached = iam_client.list_role_policies(RoleName=role_name)
+        logger.info(
+            "  ✓ Role policies visible: %s",
+            ", ".join(attached.get("PolicyNames", [])) or "(none)",
+        )
+    except ClientError as e:
+        logger.warning(f"  Could not list role policies yet: {e}")
+
+
 def create_knowledge_base_role() -> str:
     """Create Knowledge Base IAM role."""
     logger.info("[3/6] Creating Knowledge Base IAM role")
@@ -276,12 +294,20 @@ def create_knowledge_base_role() -> str:
                 "Principal": {
                     "Service": "bedrock.amazonaws.com"
                 },
-                "Action": "sts:AssumeRole"
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {"aws:SourceAccount": account_id},
+                    "ArnLike": {
+                        "aws:SourceArn": (
+                            f"arn:aws:bedrock:{region}:{account_id}:knowledge-base/*"
+                        )
+                    },
+                },
             }
         ]
     }
     
-    role_arn = create_iam_role(role_name, assume_role_policy)
+    role_arn, role_created = create_iam_role(role_name, assume_role_policy)
     
     # Always attach/update inline policies (put_role_policy will create or update)
     bedrock_invoke_policy = {
@@ -380,6 +406,12 @@ def create_knowledge_base_role() -> str:
     except ClientError:
         pass
 
+    if role_created:
+        wait_for_iam_role_propagation(role_name)
+    else:
+        logger.info(f"  Skipping IAM wait (KB role already exists: {role_name})")
+
+    logger.info(f"✓ Knowledge Base role ready: {role_arn}")
     return role_arn
 
 
@@ -620,16 +652,14 @@ def create_knowledge_base_with_s3_vectors(s3_vectors_info: Dict[str, str], knowl
         logger.error(f"  ✗ Failed to verify Knowledge Base role: {role_error}")
         raise
     
-    # Create Knowledge Base
+    # Create Knowledge Base (retry: newly created roles can take a bit to become assumable)
     logger.debug(f"Creating Knowledge Base with S3 Vectors index: {s3_vectors_info['indexArn']}")
-    response = bedrock_agent_client.create_knowledge_base(
-        name=project_name,
-        description="Knowledge base with default parser (S3 Vectors)",
-        roleArn=knowledge_base_role_arn,
-        tags={
-            project_name: 'true'
-        },
-        knowledgeBaseConfiguration={
+    create_kwargs = {
+        "name": project_name,
+        "description": "Knowledge base with default parser (S3 Vectors)",
+        "roleArn": knowledge_base_role_arn,
+        "tags": {project_name: "true"},
+        "knowledgeBaseConfiguration": {
             "type": "VECTOR",
             "vectorKnowledgeBaseConfiguration": {
                 "embeddingModelArn": f"arn:aws:bedrock:{region}::foundation-model/amazon.titan-embed-text-v2:0",
@@ -639,16 +669,40 @@ def create_knowledge_base_with_s3_vectors(s3_vectors_info: Dict[str, str], knowl
                         "embeddingDataType": "FLOAT32",
                     }
                 },
-            }
+            },
         },
-        storageConfiguration={
+        "storageConfiguration": {
             "type": "S3_VECTORS",
             "s3VectorsConfiguration": {
                 "vectorBucketArn": s3_vectors_info["vectorBucketArn"],
                 "indexArn": s3_vectors_info["indexArn"],
             },
-        }
-    )
+        },
+    }
+
+    response = None
+    last_error: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            response = bedrock_agent_client.create_knowledge_base(**create_kwargs)
+            break
+        except ClientError as e:
+            last_error = e
+            message = e.response.get("Error", {}).get("Message", "")
+            if (
+                e.response.get("Error", {}).get("Code") == "ValidationException"
+                and "unable to assume" in message.lower()
+            ):
+                wait_s = min(10 * attempt, 30)
+                logger.warning(
+                    "  Bedrock could not assume KB role yet "
+                    f"(attempt {attempt}/5). Waiting {wait_s}s..."
+                )
+                time.sleep(wait_s)
+                continue
+            raise
+    if response is None:
+        raise last_error  # type: ignore[misc]
     
     knowledge_base_id = response["knowledgeBase"]["knowledgeBaseId"]
     logger.info(f"✓ Knowledge Base created: {knowledge_base_id}")
@@ -755,7 +809,7 @@ def create_agentcore_websearch_gateway_role() -> str:
             }
         ],
     }
-    role_arn = create_iam_role(role_name, assume_role_policy)
+    role_arn, _role_created = create_iam_role(role_name, assume_role_policy)
 
     gateway_policy = {
         "Version": "2012-10-17",

@@ -1,19 +1,38 @@
-streamlit
-streamlit-chat
+# Web UI (application/)
+fastapi
+python-multipart
+uvicorn[standard]
+
+# AWS
 boto3
+botocore
+
+# LangChain / LangGraph
 langchain_aws
 langchain
+langchain_community
 langchain-openai
 openai>=2.41.0
-langchain_community
-langchain-text-splitters
-opensearch-py
-requests-aws4auth
 langgraph
+langchain-text-splitters
 langchain_experimental
+
+# MCP
 mcp
 langchain-mcp-adapters
-requests
+awslabs.aws-documentation-mcp-server
+
+# Runtime / shared utilities
+httpx
 uv
-graphviz
+requests
+requests-aws4auth
+aiosqlite
+pyyaml
+Pillow
+pytz
 rich
+numpy
+pandas
+opensearch-py
+graphviz

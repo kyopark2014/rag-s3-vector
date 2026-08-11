@@ -1,12 +1,54 @@
 # RAG with Amazon S3 Vectors
 
-Amazon Bedrock Knowledge Base와 **Amazon S3 Vectors**를 벡터 스토어로 사용하는 RAG(Retrieval-Augmented Generation) 애플리케이션입니다. Streamlit 기반 채팅 UI에서 일반 대화, RAG 검색, LangGraph Agent(SKILL/MCP), 이미지 분석, 번역 등 다양한 모드를 제공합니다.
+Amazon Bedrock Knowledge Base와 **Amazon S3 Vectors**를 벡터 스토어로 사용하는 RAG(Retrieval-Augmented Generation) 애플리케이션입니다. FastAPI + React UI에서 Skill/MCP Agent 채팅, RAG 문서 업로드, 이미지 첨부 등을 제공합니다.
+
+## 목차
+
+1. [S3 Vectors 개요](#s3-vectors-개요) — 개념, 구성 요소, 성능·통합·사용 사례
+2. [시스템 구성](#시스템-구성) — 아키텍처, 데이터 흐름, AWS 리소스, 앱 구조, UI
+3. [사전 요구 사항](#사전-요구-사항)
+4. [설치](#설치--installerpy) — `installer.py`, 문서 인덱싱
+5. [애플리케이션 실행](#애플리케이션-실행)
+6. [활용 방법](#활용-방법) — QueryVectors API 예시
+7. [제거](#제거--uninstallerpy) — `uninstaller.py`
+8. [참고 문서 링크](#참고-문서-링크)
 
 ## S3 Vectors 개요
 
-S3 Vector는 스토리지 서비스인 S3를 직접 사용하는 벡터 검색 기능으로서, 벡터 데이터를 저장하고 유사도 기반 검색을 수행할 수 있는 서비스입니다. 텍스트, 이미지, 오디오 등의 데이터를 임베딩하여 저장하고 검색할 수 있습니다. 이는 서브초 단위의 빠른 쿼리 응답 시간, 수백만 개의 벡터에 대한 검색 지원, 90% 이상의 평균 검색 정확도(recall) 제공, 메타데이터 필터링 기능 지원, 다른 AWS 서비스들과의 통합 지원의 장점을 가지고 있습니다.
+[Amazon S3 Vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html)는 클라우드에서 벡터를 저장·조회할 수 있는 **목적 특화(purpose-built) 객체 스토리지**입니다. AI 에이전트, 추론, RAG, 의미론적 검색(Semantic Search)을 위해 설계되었으며, Amazon S3와 동일한 탄력성·내구성·가용성을 목표로 하면서도 인프라를 프로비저닝하지 않고 전용 API로 벡터를 넣고 유사도 검색할 수 있습니다. 텍스트·이미지·오디오 등을 임베딩한 수치 벡터를 저장하면, 키워드 일치가 아닌 **의미적 근접성** 기준으로 유사 항목을 찾을 수 있습니다.
 
-S3 Vector는 의미론적 검색(Semantic Search), 추천 시스템, 이미지/텍스트 유사도 검색, AI 기반 검색 애플리케이션, 대규모 벡터 데이터베이스 구축에 장점이 있습니다.
+### 핵심 구성 요소
+
+| 구성 요소 | 설명 |
+|-----------|------|
+| **Vector bucket** | 벡터 저장·질의에 특화된 새로운 S3 버킷 유형 |
+| **Vector index** | 버킷 안에서 벡터를 조직하는 단위. 유사도 쿼리는 인덱스 단위로 수행 |
+| **Vector** | 인덱스에 저장되는 임베딩. `key`로 식별하며, 필터링용 메타데이터를 함께 첨부 가능 |
+
+인덱스 생성 시 **차원(dimension, 1~4096)** 과 거리 지표(**Cosine** 또는 **Euclidean**)를 지정하며, 생성 후에는 이름·차원·거리 지표·non-filterable 메타데이터 키를 변경할 수 없습니다. 기본 메타데이터는 필터 가능하고, 인덱스 생성 시 non-filterable로 지정한 키(예: 원문 `source_text`)는 저장만 하고 쿼리 필터에는 쓰지 않습니다.
+
+### 성능·규모·운영 특성
+
+- **쿼리 지연**: 비자주(infrequent) 쿼리는 서브초, 더 자주 쓰는 쿼리는 최저 약 **100ms** 수준(워크로드에 따라 상이)
+- **규모**: 인덱스당 최대 약 **20억(2B)** 벡터, 버킷당 최대 **10,000** 인덱스
+- **일관성**: 쓰기는 **강한 일관성(strong consistency)** — 방금 넣은 벡터를 바로 조회·검색에 반영
+- **비용**: 사용량 기반 과금. AWS는 업로드·저장·쿼리 비용을 기존 대비 최대 약 **90%** 절감할 수 있다고 안내([S3 Vectors 기능 페이지](https://aws.amazon.com/s3/features/vectors/))
+- **보안**: IAM·버킷 정책으로 접근 제어. 서비스 네임스페이스는 `s3vectors`. Vector bucket은 S3 Block Public Access가 항상 켜져 있으며 끌 수 없음
+- **최적화**: 쓰기/갱신/삭제에 따라 내부적으로 벡터 데이터를 자동 최적화해 가격 대비 성능을 유지
+
+고 QPS·초저지연이 필수인 실시간 검색에는 [Amazon OpenSearch Service](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-opensearch.html)가 더 적합하고, S3 Vectors는 **장기·대용량·상대적으로 쿼리 빈도가 낮은** 벡터 저장에 비용 효율이 좋습니다. OpenSearch와 계층형(tiered)으로 쓰는 패턴도 지원합니다.
+
+### AWS 서비스 통합
+
+- **Amazon Bedrock Knowledge Bases**: S3 Vectors를 벡터 스토어로 선택해 RAG 저장 비용을 낮출 수 있음 (본 프로젝트에서 사용)
+- **Amazon SageMaker Unified Studio**: Bedrock Knowledge Base를 S3 Vectors와 함께 개발·테스트
+- **Amazon OpenSearch Service**: 고급 검색(하이브리드, aggregation 등)이 필요할 때 S3 Vectors와 연동하거나 스냅샷을 OpenSearch Serverless로 보내 고성능 검색에 활용
+
+### 대표 사용 사례
+
+의미론적 문서 검색, RAG, AI 에이전트 장기 메모리, 이미지/비디오 유사도 검색, 추천·개인화, 대용량 미디어 라이브러리에서의 장면·콘텐츠 탐색, 의료 영상 유사 사례 검색 등 — **대규모 임베딩을 비용 효율적으로 유지하면서 유사도 검색**이 필요한 워크로드에 적합합니다.
+
+참고: [What is Amazon S3 Vectors?](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html) · [Getting started](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-getting-started.html) · [Limitations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html)
 
 ## 시스템 구성
 
@@ -15,14 +57,14 @@ S3 Vector는 의미론적 검색(Semantic Search), 추천 시스템, 이미지/�
 ```mermaid
 flowchart TB
     subgraph Client["클라이언트"]
-        UI["Streamlit UI<br/>(application/app.py)"]
+        UI["React SPA + FastAPI<br/>(application/server.py)"]
     end
 
     subgraph App["애플리케이션"]
-        Chat["chat.py<br/>RAG / 대화 / 번역"]
+        Chat["chat.py<br/>RAG / Agent 실행"]
         Agent["langgraph_agent.py<br/>LangGraph Agent"]
         MCP["MCP Servers<br/>kb-retrieve, text_extraction, ..."]
-        Skills["skills/<br/>pdf, docx, img2text, ..."]
+        Skills["skills/<br/>pdf, docx, pptx, xlsx, ..."]
     end
 
     subgraph AWS["AWS (installer.py로 프로비저닝)"]
@@ -38,7 +80,7 @@ flowchart TB
         LLM["Claude / Nova 등"]
     end
 
-    UI --> Chat
+    UI -->|REST / SSE| Chat
     UI --> Agent
     Agent --> MCP
     Agent --> Skills
@@ -80,152 +122,43 @@ flowchart TB
 rag-s3-vector/
 ├── installer.py             # AWS 인프라 프로비저닝
 ├── uninstaller.py           # AWS 인프라 삭제
+├── run_local.sh             # 프론트 빌드 + uvicorn :8501
+├── Dockerfile               # FastAPI + React 컨테이너
 ├── requirements.txt
-├── application/
-│   ├── app.py               # Streamlit 메인 UI
-│   ├── chat.py              # RAG, 대화, 번역, 이미지 요약
-│   ├── langgraph_agent.py   # LangGraph Agent (SKILL + MCP)
-│   ├── mcp_config.py        # MCP 서버 설정
-│   ├── mcp_retrieve.py      # Knowledge Base retrieve
-│   ├── mcp_server_retrieve.py
-│   ├── mcp_server_text_extraction.py
-│   ├── config.json          # installer가 갱신하는 런타임 설정
-│   ├── skills/              # Agent용 SKILL (pdf, docx, img2text 등)
-│   ├── contents/            # 로컬 문서 (선택)
-│   └── artifacts/           # Agent 실행 결과물
+└── application/
+    ├── server.py            # FastAPI 진입점 + SPA 서빙
+    ├── api/                 # REST / SSE 라우트
+    ├── web/                 # Vite + React UI
+    ├── chat.py              # RAG / Agent 실행 (run_agent)
+    ├── langgraph_agent.py   # LangGraph Agent (SKILL + MCP)
+    ├── mcp_config.py        # MCP 서버 설정
+    ├── mcp_retrieve.py      # Knowledge Base retrieve
+    ├── mcp_server_retrieve.py
+    ├── mcp_server_text_extraction.py
+    ├── config.json          # installer가 갱신하는 런타임 설정
+    ├── skills/              # Agent용 SKILL (pdf, docx, pptx, xlsx 등)
+    ├── contents/            # 로컬 문서 (선택)
+    └── artifacts/           # Agent 실행 결과물
 ```
 
-### 대화 모드
+### UI 기능
 
-| 모드 | 설명 |
+| 기능 | 설명 |
 |------|------|
-| 일상적인 대화 | Bedrock LLM과 일반 채팅 |
-| RAG | Knowledge Base + S3 Vectors 검색 후 답변 |
-| Agent | SKILL + MCP(s3_vector, aws_documentation, web_fetch, text_extraction) |
-| Agent (Chat) | Agent + 대화 이력 유지 |
-| 이미지 분석 | 멀티모달 이미지 분석 |
-| 번역하기 | 한↔영 번역 |
+| Agent 채팅 | Skill + MCP를 활용한 LangGraph Agent (SSE 스트리밍) |
+| 멀티 태스크 | 사이드바에서 대화방 생성/핀/이름변경/삭제 |
+| Skill / MCP 선택 | `skills.list` / `mcp.list` 기반 토글, favorite 저장 |
+| RAG 업로드 | PDF 등 문서 → S3 + Knowledge Base ingestion |
+| 이미지 첨부 | 클립보드/파일 업로드 → S3 URL 첨부 |
+| 로컬 User ID | 쿠키 세션으로 사용자별 대화·업로드 구분 |
 
 ## 사전 요구 사항
 
 - Python 3.10+
+- Node.js 20+ (React 프론트 빌드)
 - AWS CLI 자격 증명 구성 (`aws configure` 또는 환경 변수)
 - `us-west-2` 리전에서 Bedrock 모델 및 S3 Vectors 사용 권한
-- (선택) Node.js (`npx` — web_fetch MCP), `uv` (aws_documentation MCP)
-
-### Message Trim
-
-LangGraph 에이전트([application/langgraph_agent.py](./application/langgraph_agent.py)의 `call_model`)는 LLM 호출 직전에 **HumanMessage 기준 최근 N턴**만 남깁니다. LangGraph state의 `messages`는 checkpointer에 그대로 두고, **모델에 넘기는 메시지만** trim합니다. `history_mode=Enable`/`Disable` 모두 동일하게 적용됩니다.
-
-**기본값:** `MAX_CONTEXT_TURNS = 5` (일반 채팅의 `SimpleMemory(k=5)`와 동일한 “최근 5턴” 의도)
-
-**설정 변경:**
-
-- [application/langgraph_agent.py](./application/langgraph_agent.py)의 `MAX_CONTEXT_TURNS` 상수 수정
-- 또는 `create_agent()`에서 생성하는 config의 `max_turns` / `configurable.max_turns` 지정
-- `max_turns=0`이면 trim 비활성화
-
-상수와 trim 함수는 `langgraph_agent.py`에 정의합니다.
-
-```python
-# application/langgraph_agent.py
-MAX_CONTEXT_TURNS = 5
-
-
-def trim_messages_by_human_turns(messages: list, max_turns: int) -> list:
-    """Keep messages from the last N HumanMessage turns (inclusive)."""
-    if max_turns <= 0 or not messages:
-        return messages
-
-    human_indices = [i for i, msg in enumerate(messages) if isinstance(msg, HumanMessage)]
-    if len(human_indices) <= max_turns:
-        return messages
-
-    return messages[human_indices[-max_turns]:]
-```
-
-`call_model`에서는 `ToolMessage` content 정규화 후 trim을 적용합니다.
-
-```python
-# application/langgraph_agent.py — call_model() 내부
-        max_turns = (
-            config.get("configurable", {}).get("max_turns")
-            or config.get("max_turns")
-            or MAX_CONTEXT_TURNS
-        )
-        trimmed = trim_messages_by_human_turns(messages, max_turns)
-        if len(trimmed) < len(messages):
-            logger.info(
-                f"trimmed messages from {len(messages)} to {len(trimmed)} "
-                f"(max_turns={max_turns})"
-            )
-            messages = trimmed
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system),
-            MessagesPlaceholder(variable_name="messages"),
-        ])
-        chain = prompt | model
-        async for chunk in chain.astream({"messages": messages}):
-            ...
-```
-
-에이전트 config는 `create_agent()`에서 생성하며, `history_mode`와 관계없이 `max_turns`를 전달합니다.
-
-```python
-# application/langgraph_agent.py — create_agent()
-    if history_mode == "Enable":
-        app = buildChatAgentWithHistory(tools)
-        config = {
-            "recursion_limit": 500,
-            "configurable": {"thread_id": chat.user_id},
-            "tools": tools,
-            "system_prompt": system_prompt,
-            "max_turns": MAX_CONTEXT_TURNS,
-        }
-    else:
-        app = buildChatAgent(tools)
-        config = {
-            "recursion_limit": 500,
-            "configurable": {"thread_id": chat.user_id},
-            "tools": tools,
-            "system_prompt": system_prompt,
-            "max_turns": MAX_CONTEXT_TURNS,
-        }
-```
-
-**`max_turns=5`의 의미**
-
-- **사용자 HumanMessage 5개**와, 각 턴에 이어진 **모든 후속 메시지**를 유지
-- 1턴 = `HumanMessage` 1개 + 그 뒤의 `AIMessage`, `ToolMessage`, 도구 feedback loop 전체
-- 도구를 여러 번 호출해도 **같은 사용자 질문이면 1턴**으로 카운트
-
-**예 (도구 사용 포함)**
-
-```
-Human(Q1) → AI(tool_calls) → ToolMessage → AI(A1)
-Human(Q2) → AI(A2)
-Human(Q3) → AI(tool_calls) → ToolMessage → AI(A3)
-```
-
-`max_turns=2`이면 **Q2부터** 유지:
-
-```
-Human(Q2) → AI(A2) → Human(Q3) → AI(tool_calls) → ToolMessage → AI(A3)
-```
-
-**메시지 개수 trim과의 차이**
-
-| 방식 | `N=5`일 때 |
-|------|------------|
-| 이전 (메시지 개수) | 메시지 객체 5개만 유지 → 도구 루프 때문에 사용자 턴 수가 불규칙 |
-| 현재 (HumanMessage 턴) | 사용자 질문 5개 + 각 턴의 AI/Tool 응답 전체 유지 |
-
-**Checkpointer와의 관계**
-
-- `history_mode=Enable`일 때 `MemorySaver` checkpointer에는 **전체 대화 이력**이 저장됩니다.
-- trim은 LLM 컨텍스트 윈도우 관리용이며, 저장된 history를 삭제하지 않습니다.
-- CloudWatch(`/ecs/...`) 또는 애플리케이션 로그에서 `trimmed messages from X to Y (max_turns=5)`로 trim 여부를 확인할 수 있습니다.
+- (선택) `uv` (aws_documentation MCP), `npx` (web_fetch MCP)
 
 ## 설치 — `installer.py`
 
@@ -273,6 +206,62 @@ python installer.py
 1. 문서를 S3 버킷 `docs/`에 업로드합니다.
 2. Bedrock 콘솔 또는 API에서 Knowledge Base **Sync**를 실행합니다.
 
+## 애플리케이션 실행
+
+```bash
+pip install -r requirements.txt
+
+# 프론트 빌드 후 uvicorn (포트 8501)
+./run_local.sh
+```
+
+브라우저에서 http://localhost:8501 을 엽니다. 로컬 User ID로 세션을 만든 뒤 Skill/MCP와 모델을 선택하고 Agent 채팅을 사용합니다.
+
+개발 시 React HMR:
+
+```bash
+# 터미널 1 — API
+uvicorn application.server:app --host 0.0.0.0 --port 8501
+
+# 터미널 2 — Vite ( /api 프록시 → 8501 )
+cd application/web && npm install && npm run dev
+```
+
+## 활용 방법
+
+QueryVectors API를 사용하여 유사도 검색을 수행할 수 있습니다.
+검색 시 지정할 수 있는 주요 파라미터에는 쿼리 벡터, 반환할 결과 수(K-최근접 이웃), 인덱스 ARN, 메타데이터 필터(선택사항)가 있습니다.
+
+```python
+import boto3 
+import json 
+
+# Bedrock Runtime 및 S3 Vectors 클라이언트 생성
+bedrock = boto3.client("bedrock-runtime", region_name="us-west-2")
+s3vectors = boto3.client("s3vectors", region_name="us-west-2") 
+
+# 쿼리 텍스트를 임베딩으로 변환
+input_text = "adventures in space"
+response = bedrock.invoke_model(
+    modelId="amazon.titan-embed-text-v2:0",
+    body=json.dumps({"inputText": input_text})
+) 
+
+# 임베딩 추출 및 벡터 검색
+model_response = json.loads(response["body"].read())
+embedding = model_response["embedding"]
+
+# 벡터 인덱스 쿼리
+response = s3vectors.query_vectors(
+    vectorBucketName="rag-s3-vector-{accountId}",
+    indexName="rag-s3-vector",
+    queryVector={"float32": embedding}, 
+    topK=3, 
+    returnDistance=True,
+    returnMetadata=True
+)
+```
+
 ## 제거 — `uninstaller.py`
 
 `uninstaller.py`는 `installer.py`가 생성한 리소스를 삭제합니다.
@@ -314,52 +303,7 @@ python uninstaller.py --yes --delete-s3-bucket --delete-cloudfront
 
 > CloudFront는 비활성화 후 배포가 완전히 내려가야 삭제됩니다. 삭제가 건너뛰어지면 `--delete-cloudfront`로 재실행하세요.
 
-## 애플리케이션 실행
-
-```bash
-pip install -r requirements.txt
-cd application
-streamlit run app.py
-```
-
-브라우저에서 Streamlit UI가 열리면 사이드바에서 대화 모드와 MCP/Skill을 선택합니다.
-
-## 활용 방법
-
-QueryVectors API를 사용하여 유사도 검색을 수행할 수 있습니다.
-검색 시 지정할 수 있는 주요 파라미터에는 쿼리 벡터, 반환할 결과 수(K-최근접 이웃), 인덱스 ARN, 메타데이터 필터(선택사항)가 있습니다.
-
-```python
-import boto3 
-import json 
-
-# Bedrock Runtime 및 S3 Vectors 클라이언트 생성
-bedrock = boto3.client("bedrock-runtime", region_name="us-west-2")
-s3vectors = boto3.client("s3vectors", region_name="us-west-2") 
-
-# 쿼리 텍스트를 임베딩으로 변환
-input_text = "adventures in space"
-response = bedrock.invoke_model(
-    modelId="amazon.titan-embed-text-v2:0",
-    body=json.dumps({"inputText": input_text})
-) 
-
-# 임베딩 추출 및 벡터 검색
-model_response = json.loads(response["body"].read())
-embedding = model_response["embedding"]
-
-# 벡터 인덱스 쿼리
-response = s3vectors.query_vectors(
-    vectorBucketName="rag-s3-vector-{accountId}",
-    indexName="rag-s3-vector",
-    queryVector={"float32": embedding}, 
-    topK=3, 
-    returnDistance=True,
-    returnMetadata=True
-)
-```
-
-## Reference
+## 참고 문서 링크
 
 [Working with S3 Vectors and vector buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html)
 
