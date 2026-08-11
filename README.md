@@ -5,8 +5,8 @@ Amazon Bedrock Knowledge Base와 **Amazon S3 Vectors**를 벡터 스토어로 �
 ## 목차
 
 1. [S3 Vectors 개요](#s3-vectors-개요) — 개념, 구성 요소, 성능·통합·사용 사례
-2. [시스템 구성](#시스템-구성) — 아키텍처, 데이터 흐름, AWS 리소스, 앱 구조, UI
-3. [Metadata Filtering](#metadata-filtering-s3-vectors--bedrock-knowledge-bases) — sidecar, S3 Vectors 필터 연산자, Bedrock Retrieve
+2. [시스템 구성](#시스템-구성) — 아키텍처, 데이터 흐름, AWS 리소스, 앱 구조, UI, 예상 비용
+3. [RAG의 활용](#rag의-활용) — Knowledge Base 조회, Metadata Filtering
 4. [사전 요구 사항](#사전-요구-사항)
 5. [설치](#설치--installerpy) — `installer.py`, 문서 인덱싱
 6. [애플리케이션 실행](#애플리케이션-실행)
@@ -154,7 +154,135 @@ rag-s3-vector/
 | 이미지 첨부 | 클립보드/파일 업로드 → S3 URL 첨부 |
 | 로컬 User ID | 쿠키 세션으로 사용자별 대화·업로드 구분 |
 
-## Metadata Filtering (S3 Vectors + Bedrock Knowledge Bases)
+### 예상 비용
+
+여기서 적용한 RAG의 구조는  **Customer-managed Knowledge Base + S3 Vectors** 조합입니다. KB 기능 자체에 별도 요금이 없고, **벡터 스토어(S3 Vectors) + 임베딩/추론 모델 + 원본 S3** 사용량에 과금됩니다 ([Bedrock Pricing](https://aws.amazon.com/bedrock/pricing/), [Prescriptive Guidance — Cost](https://docs.aws.amazon.com/prescriptive-guidance/latest/choosing-an-aws-vector-database-for-rag-use-cases/cost.html)). AWS는 S3 Vectors로 업로드·저장·쿼리 비용을 기존 대비 최대 약 **90%** 절감할 수 있다고 안내합니다 ([KB + S3 Vectors 블로그](https://aws.amazon.com/blogs/machine-learning/building-cost-effective-rag-applications-with-amazon-bedrock-knowledge-bases-and-amazon-s3-vectors/), [S3 Vectors 기능](https://aws.amazon.com/s3/features/vectors/)).
+
+#### 비용 구성
+
+| 항목 | 과금 기준 | 참고 |
+|------|-----------|------|
+| S3 Vectors 스토리지 | GB-month (벡터 데이터 + 메타데이터 + key) | 1024차원 ≈ 4 KB/벡터 (4 bytes × 1024) |
+| S3 Vectors PUT | 업로드 logical GB (`$0.20`/GB, PUT당 최소 128 KB) | 배치 PUT으로 단가 절감 |
+| S3 Vectors 쿼리 | 요청 수 + 처리 데이터(TB) + 반환 데이터(GB) | non-filterable 메타는 처리량에서 제외. 쿼리당 반환 첫 512 KB 무료 |
+| Bedrock 임베딩 | 인제스션·쿼리 임베딩 토큰 | 예: Titan Text Embeddings V2 |
+| Bedrock 응답 생성 | RetrieveAndGenerate / Agent LLM 토큰 | 모델별 On-Demand 단가 |
+| 원본 문서 S3 | 표준 S3 스토리지·요청 | 데이터 소스 버킷 |
+
+단가·예시는 [Amazon S3 pricing — Vectors](https://aws.amazon.com/s3/pricing/) (US East (N. Virginia)) 기준입니다. 리전·약정·사용 패턴에 따라 달라질 수 있습니다.
+
+#### AWS 공식 RAG 비용 예시 (S3 Vectors)
+
+[Amazon S3 pricing](https://aws.amazon.com/s3/pricing/)의 Pricing example 1·2 (RAG 워크플로)를 요약합니다. 벡터당 6.17 KB(벡터 4 KB + filterable 1 KB + non-filterable 1 KB + key 0.17 KB), 6개월마다 전체 갱신(월 PUT ≈ 16.7%), 쿼리당 top-100 반환.
+
+| 시나리오 | 규모 | 월 쿼리 | 스토리지 | PUT | 쿼리 | **월 합계** |
+|----------|------|---------|----------|-----|------|-------------|
+| Example 1 | 1,000만 벡터 / 40 인덱스 (인덱스당 25만) | 100만 | $3.54 | $1.97 | $5.87 | **~$11.38** |
+| Example 2 | 5억 벡터 / 40 인덱스 (인덱스당 1,250만) | 1,000만 | $176.52 | $98.07 | $1,045.88 | **~$1,320.47** |
+
+쿼리 단가 구성(공식 예시): API `$2.50`/백만 쿼리 + data processed(인덱스 규모 티어: `$0.004` / `$0.002` / `$0.0004` per TB) + data returned `$0.01`/GB. Example 1·2는 반환량이 무료 구간(쿼리당 약 500 KB) 이하여 반환 요금 $0입니다.
+
+> 위 수치는 **S3 Vectors만**의 예측입니다. Knowledge Base 인제스션 임베딩·RetrieveAndGenerate LLM·원본 S3 요금은 별도로 더해집니다. 세부 산식은 [S3 pricing — Vectors](https://aws.amazon.com/s3/pricing/)를, 통합 절차·비용 절감 맥락은 [Using S3 Vectors with Amazon Bedrock Knowledge Bases](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-bedrock-kb.html)와 [KB + S3 Vectors 블로그](https://aws.amazon.com/blogs/machine-learning/building-cost-effective-rag-applications-with-amazon-bedrock-knowledge-bases-and-amazon-s3-vectors/)를 참고하세요. 워크로드별 견적은 [AWS Pricing Calculator](https://calculator.aws/)로 재산정하는 것이 좋습니다.
+
+## RAG의 활용
+
+### Knowledge Base 조회
+
+채팅 Agent가 MCP 도구 `retrieve`를 호출하면 Bedrock Knowledge Base `Retrieve` API로 S3 Vectors 인덱스를 의미 검색합니다. UI에서 MCP **knowledge base**(`kb-retrieve`)를 켠 뒤, 예: *"knowledge base로 보일러 에러 코드 검토하세요."* 처럼 요청하면 이 경로가 사용됩니다 ([실행 결과](#실행-결과)).
+
+#### 호출 흐름
+
+```text
+UI 채팅 → langgraph_agent
+  → MCP stdio: mcp_server_retrieve.py (도구 retrieve)
+    → mcp_retrieve.retrieve(keyword)
+      → bedrock-agent-runtime.retrieve (knowledgeBaseId from config.json)
+```
+
+| 단계 | 파일 | 역할 |
+|------|------|------|
+| MCP 등록 | [`application/mcp_config.py`](application/mcp_config.py) | `kb-retrieve` → `python …/mcp_server_retrieve.py` |
+| Agent 연결 | [`application/langgraph_agent.py`](application/langgraph_agent.py) | 선택 MCP 로드, `RAG_USER_ID` 환경변수 주입 |
+| MCP 도구 | [`application/mcp_server_retrieve.py`](application/mcp_server_retrieve.py) | FastMCP `@mcp.tool() retrieve(keyword)` |
+| KB 조회 | [`application/mcp_retrieve.py`](application/mcp_retrieve.py) | `bedrock-agent-runtime.retrieve` + 결과 JSON 변환 |
+| (대안) 직접 RAG | [`application/chat.py`](application/chat.py) | `retrieve` / `run_rag_with_knowledge_base` — MCP 없이 동일 API |
+
+`knowledge_base_id`는 [`application/config.json`](application/config.json)에 있으며, `installer.py`가 생성·갱신합니다.
+
+#### 핵심 코드
+
+1) MCP 도구 노출 — [`mcp_server_retrieve.py`](application/mcp_server_retrieve.py)
+
+```python
+@mcp.tool()
+def retrieve(keyword: str) -> str:
+    """Query the keyword using RAG based on the knowledge base."""
+    return mcp_retrieve.retrieve(keyword)
+```
+
+2) Bedrock `Retrieve` 호출 — [`mcp_retrieve.py`](application/mcp_retrieve.py)
+
+```python
+response = bedrock_agent_runtime_client.retrieve(
+    retrievalQuery={"text": query},
+    knowledgeBaseId=knowledge_base_id,
+    retrievalConfiguration={
+        "vectorSearchConfiguration": {"numberOfResults": number_of_results},  # 기본 5
+    },
+)
+```
+
+반환의 `retrievalResults[]`에서 `content.text`, S3 `location`, 페이지 메타(`x-amz-bedrock-kb-document-page-number`)를 읽어 아래 JSON 문자열로 돌려줍니다.
+
+```json
+[
+  {
+    "contents": "검색된 청크 텍스트…",
+    "reference": {
+      "url": "https://…/docs/error_code.pdf",
+      "title": "error_code.pdf",
+      "from": "RAG",
+      "page": 3
+    }
+  }
+]
+```
+
+KB ID가 없거나 stale이면 `ResourceNotFoundException` 시 `list_knowledge_bases`로 `projectName`과 이름 일치 KB를 찾아 `config.json`을 갱신한 뒤 재시도합니다 (같은 파일).
+
+3) Agent에서 MCP 기동 — [`mcp_config.py`](application/mcp_config.py) + [`langgraph_agent.py`](application/langgraph_agent.py)
+
+```python
+# mcp_config.load_config("kb-retrieve") 요약
+"kb-retrieve": {
+    "command": "python",
+    "args": [f"{workingDir}/mcp_server_retrieve.py"],
+}
+```
+
+```python
+# langgraph_agent: 세션 사용자 스코프를 MCP env로 전달
+env["RAG_USER_ID"] = session_user_id
+```
+
+메타데이터 필터(`vectorSearchConfiguration.filter`)를 붙이는 예는 아래 [Bedrock Knowledge Base Retrieve 필터](#bedrock-knowledge-base-retrieve-필터-s3-vectors-백엔드)를 참고하세요. 현재 `mcp_retrieve.retrieve`는 `numberOfResults`만 설정합니다.
+
+4) MCP 없이 동일 API — [`chat.py`](application/chat.py)
+
+`chat.retrieve(query)`는 위와 같은 `bedrock-agent-runtime.retrieve` 호출입니다. `run_rag_with_knowledge_base`는 검색 결과를 컨텍스트로 묶어 LLM에 넘깁니다.
+
+```python
+json_docs = retrieve(query)
+relevant_docs = json.loads(json_docs)
+relevant_context = "".join(f"{doc['contents']}\n\n" for doc in relevant_docs)
+# → get_rag_prompt 체인에 question + context 로 전달
+```
+
+S3 Vectors를 **KB 없이** 직접 질의하려면 [활용 방법](#활용-방법)의 `QueryVectors` 예시를 사용합니다.
+
+
+
+### Metadata Filtering (S3 Vectors + Bedrock Knowledge Bases)
 
 Amazon Bedrock Knowledge Bases는 원본 문서와 함께 `파일명.확장자.metadata.json` sidecar를 S3에 올리면 문서별 커스텀 메타데이터를 인덱싱합니다.
 조회 시 `Retrieve`의 `vectorSearchConfiguration.filter`로 사전 필터링한 뒤 유사도 검색을 수행합니다. 벡터 스토어가 **S3 Vectors**일 때도 sidecar → 인제스션 → 필터 조회 흐름은 동일하며, 필터 연산자·크기 제한은 스토어별로 다릅니다.
@@ -166,7 +294,7 @@ Amazon Bedrock Knowledge Bases는 원본 문서와 함께 `파일명.확장자.m
 `docs/{projectName}/{user_id}/{file}` 와 함께 `{file}.metadata.json` sidecar를 업로드합니다.
 `installer.py`는 Bedrock KB용 non-filterable 키(`AMAZON_BEDROCK_TEXT`, `AMAZON_BEDROCK_METADATA`)를 인덱스에 미리 등록합니다.
 
-### 본 프로젝트 sidecar 스키마
+#### 본 프로젝트 sidecar 스키마
 
 Bedrock이 지원하는 타입은 `STRING` / `NUMBER` / `BOOLEAN` / `STRING_LIST` 입니다.
 
@@ -204,7 +332,7 @@ Bedrock이 지원하는 타입은 `STRING` / `NUMBER` / `BOOLEAN` / `STRING_LIST
 
 모든 속성은 `includeForEmbedding: false`로 두어 **필터 전용**으로 씁니다.
 
-### S3 Vectors 네이티브 메타데이터 필터
+#### S3 Vectors 네이티브 메타데이터 필터
 
 S3 Vectors는 **filterable** / **non-filterable** 두 종류를 지원합니다.
 
@@ -217,7 +345,7 @@ S3 Vectors는 **filterable** / **non-filterable** 두 종류를 지원합니다.
 
 유사도 검색과 필터는 **동시에** 평가됩니다(검색 후 후처리가 아님). 매칭 결과가 적으면 `topK`보다 적은 결과가 반환될 수 있습니다. non-filterable 키로 필터하면 `400 Bad Request`입니다.
 
-#### `QueryVectors` 필터 연산자
+- `QueryVectors` 필터 연산자
 
 [AWS 문서](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-metadata-filtering.html) 기준:
 
@@ -250,7 +378,7 @@ S3 Vectors는 **filterable** / **non-filterable** 두 종류를 지원합니다.
 
 배열 메타데이터 예: `"category": ["documentary", "romance"]` 인 벡터는 `{ "category": { "$eq": "documentary" } }` 에 매칭됩니다.
 
-### Bedrock Knowledge Base `Retrieve` 필터 (S3 Vectors 백엔드)
+#### Bedrock Knowledge Base `Retrieve` 필터 (S3 Vectors 백엔드)
 
 Knowledge Base API는 Bedrock 필터 이름을 사용합니다. S3 Vectors를 벡터 스토어로 쓸 때:
 
@@ -289,7 +417,7 @@ filter={"owner": {"$eq": "user01"}}
 filter={"owner": {"$in": ["user01"]}}
 ```
 
-### 검색 설정 요약
+#### 검색 설정 요약
 
 | 경로 | 검색 | 필터 |
 |------|------|------|
@@ -298,7 +426,13 @@ filter={"owner": {"$in": ["user01"]}}
 
 Agent 경로에서는 `langgraph_agent`가 RAG MCP(`kb-retrieve`)에 `RAG_USER_ID`를 주입해 사용자 스코프를 넘길 수 있습니다. 업로드 시 sidecar의 `owner`가 그 사용자 ID로 채워집니다.
 
-## 사전 요구 사항
+
+
+## 설치 및 배포
+
+
+
+### 사전 요구 사항
 
 - Python 3.10+
 - Node.js 20+ (React 프론트 빌드)
@@ -306,7 +440,7 @@ Agent 경로에서는 `langgraph_agent`가 RAG MCP(`kb-retrieve`)에 `RAG_USER_I
 - `us-west-2` 리전에서 Bedrock 모델 및 S3 Vectors 사용 권한
 - (선택) `uv` (aws_documentation MCP), `npx` (web_fetch MCP)
 
-## 설치 — `installer.py`
+### 설치 — `installer.py`
 
 `installer.py`는 boto3로 CDK 없이 AWS 리소스를 생성합니다.
 
@@ -315,7 +449,7 @@ pip install boto3
 python installer.py
 ```
 
-### 실행 순서
+#### 실행 순서
 
 | 단계 | 작업 |
 |------|------|
@@ -347,12 +481,12 @@ python installer.py
 
 > CloudFront 배포는 완전히 활성화되기까지 15~20분 정도 걸릴 수 있습니다.
 
-### 문서 인덱싱
+#### 문서 인덱싱
 
 1. 문서를 S3 버킷 `docs/`에 업로드합니다.
 2. Bedrock 콘솔 또는 API에서 Knowledge Base **Sync**를 실행합니다.
 
-## 애플리케이션 실행
+### 애플리케이션 실행
 
 ```bash
 pip install -r requirements.txt
@@ -373,7 +507,7 @@ uvicorn application.server:app --host 0.0.0.0 --port 8501
 cd application/web && npm install && npm run dev
 ```
 
-## 활용 방법
+### 활용 방법
 
 QueryVectors API로 유사도 검색을 수행합니다. 주요 파라미터는 쿼리 벡터, `topK`, 인덱스(버킷/이름 또는 ARN), 선택적 **메타데이터 `filter`** 입니다. 필터 문법·한도는 [Metadata Filtering](#metadata-filtering-s3-vectors--bedrock-knowledge-bases)을 참고하세요.
 
@@ -432,7 +566,7 @@ response = s3vectors.query_vectors(
 python uninstaller.py
 ```
 
-### 삭제 대상
+#### 삭제 대상
 
 **기본 삭제 (프로젝트 전용):**
 
@@ -447,7 +581,7 @@ python uninstaller.py
 - S3 문서 버킷 (`--delete-s3-bucket`)
 - CloudFront 배포 및 OAI (`--delete-cloudfront`)
 
-### 옵션
+#### 옵션
 
 ```bash
 # 확인 프롬프트 없이 프로젝트 리소스만 삭제
@@ -464,6 +598,12 @@ python uninstaller.py --yes --delete-s3-bucket --delete-cloudfront
 ```
 
 > CloudFront는 비활성화 후 배포가 완전히 내려가야 삭제됩니다. 삭제가 건너뛰어지면 `--delete-cloudfront`로 재실행하세요.
+
+
+
+
+
+
 
 ## 실행 결과
 
