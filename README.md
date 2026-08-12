@@ -2,6 +2,8 @@
 
 Amazon Bedrock Knowledge Base와 **Amazon S3 Vectors**를 벡터 스토어로 사용하는 RAG(Retrieval-Augmented Generation) 애플리케이션입니다. FastAPI + React UI에서 Skill/MCP Agent 채팅, RAG 문서 업로드, 이미지 첨부 등을 제공합니다.
 
+<img width="682" height="316" alt="image" src="https://github.com/user-attachments/assets/189c449a-79d6-4d64-9f6e-8a04f45c7c19" />
+
 ## 목차
 
 1. [S3 Vectors 개요](#s3-vectors-개요) — 개념, 구성 요소, 성능·통합·사용 사례
