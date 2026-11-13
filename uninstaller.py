@@ -16,7 +16,7 @@ from botocore.exceptions import ClientError
 # Configuration (must match installer.py)
 project_name = "rag-s3-vector"
 region = "us-west-2"
-AGENTCORE_GATEWAY_REGION = "us-east-1"
+AGENTCORE_GATEWAY_REGION = "us-west-2"
 AGENTCORE_WEBSEARCH_GATEWAY_NAME = "gateway-websearch"
 cloudfront_comment = "CloudFront-for-rag-project"
 oai_comment = "OAI for RAG Project"
